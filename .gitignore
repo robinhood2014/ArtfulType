@@ -1,8 +1,10 @@
 vmac/*.app/
 vmac/*.ROM
+vmac/*.ini
 *.dsk
 *.img
 *.iso
+*.hda
 build/
 .DS_Store
 .claude/

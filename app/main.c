@@ -223,12 +223,45 @@ static void MakeWindow(void)
     gScrollBar = NewControl(gWindow, &sbRect, "\p", false, 0, 0, 0, scrollBarProc, 0);
 }
 
-static void AdjustScrollbar(void)
+/*
+    The scrollbar's value is never tracked as an independent counter --
+    it's always derived fresh from TextEdit's own destRect vs. viewRect,
+    so it can't drift out of sync with where the text actually is. Every
+    scroll operation below scrolls by (current real offset - desired
+    offset) and then re-reads the real offset afterward, rather than
+    trusting an incrementally-adjusted running total.
+*/
+static short CurrentScrollOffset(TEHandle te)
+{
+    return (**te).viewRect.top - (**te).destRect.top;
+}
+
+static void SyncScrollbarToOffset(void)
+{
+    short newValue = CurrentScrollOffset(gActiveTE);
+
+    /* SetControlValue always redraws the control, even when the value is
+       unchanged -- called every tick, an unguarded call here would redraw
+       the scrollbar (and the flicker that comes with it) on every single
+       keystroke for no reason. */
+    if (newValue != GetControlValue(gScrollBar))
+        SetControlValue(gScrollBar, newValue);
+}
+
+/*
+    Updates the scrollbar's range/visibility only -- no clamping of the
+    current position. Used on the typing path, where ScrollCaretIntoView
+    already owns getting the position right; re-deriving maxVal from
+    TEGetHeight for a line that's actively growing as you type is exactly
+    the kind of thing that could disagree with ScrollCaretIntoView's own
+    (separately computed) target by a pixel or two, and clamping on that
+    discrepancy every keystroke is what was causing a brief upward jump.
+*/
+static void UpdateScrollbarRange(void)
 {
     long textHeight;
     short viewHeight;
     short maxVal;
-    short curVal;
     Boolean shouldShow;
 
     textHeight = TEGetHeight((**gActiveTE).nLines, 0, gActiveTE);
@@ -238,12 +271,6 @@ static void AdjustScrollbar(void)
 
     if (maxVal != GetControlMaximum(gScrollBar))
         SetControlMaximum(gScrollBar, maxVal);
-
-    curVal = GetControlValue(gScrollBar);
-    if (curVal > maxVal) {
-        TEScroll(0, curVal - maxVal, gActiveTE);
-        SetControlValue(gScrollBar, maxVal);
-    }
 
     shouldShow = (maxVal > 0);
     if (shouldShow != gScrollBarVisible) {
@@ -255,20 +282,45 @@ static void AdjustScrollbar(void)
     }
 }
 
+/*
+    Full version: also clamps the current scroll position if it now
+    exceeds the (possibly shrunk) range. Needed after anything that can
+    reduce content height -- Style commands, zoom, load/new, mode switch
+    -- but not after plain typing, which only ever grows it.
+*/
+static void AdjustScrollbar(void)
+{
+    short maxVal;
+    short curOffset;
+
+    UpdateScrollbarRange();
+
+    maxVal = GetControlMaximum(gScrollBar);
+    curOffset = CurrentScrollOffset(gActiveTE);
+    if (curOffset > maxVal)
+        TEScroll(0, curOffset - maxVal, gActiveTE);
+    else if (curOffset < 0)
+        TEScroll(0, curOffset, gActiveTE);
+
+    SyncScrollbarToOffset();
+}
+
+static short LineContaining(TEHandle te, short pos)
+{
+    short line = 0;
+
+    while (line < (**te).nLines - 1 && (**te).lineStarts[line + 1] <= pos)
+        line++;
+    return line;
+}
+
 static void ScrollCaretIntoView(void)
 {
-    short selEnd;
     short caretLine;
     short lineTop, lineBottom;
     short viewTop, viewBottom;
-    short overflow;
-    short newValue;
 
-    selEnd = (**gActiveTE).selEnd;
-
-    caretLine = 0;
-    while (caretLine < (**gActiveTE).nLines - 1 && (**gActiveTE).lineStarts[caretLine + 1] <= selEnd)
-        caretLine++;
+    caretLine = LineContaining(gActiveTE, (**gActiveTE).selEnd);
 
     lineTop = (**gActiveTE).destRect.top + TEGetHeight(caretLine, 0, gActiveTE);
     lineBottom = lineTop + TEGetHeight(caretLine + 1, caretLine, gActiveTE);
@@ -276,32 +328,22 @@ static void ScrollCaretIntoView(void)
     viewTop = (**gActiveTE).viewRect.top;
     viewBottom = (**gActiveTE).viewRect.bottom;
 
-    if (lineBottom > viewBottom) {
-        overflow = lineBottom - viewBottom;
-        TEScroll(0, -overflow, gActiveTE);
-        newValue = GetControlValue(gScrollBar) + overflow;
-        if (newValue > GetControlMaximum(gScrollBar))
-            newValue = GetControlMaximum(gScrollBar);
-        SetControlValue(gScrollBar, newValue);
-    } else if (lineTop < viewTop) {
-        overflow = viewTop - lineTop;
-        TEScroll(0, overflow, gActiveTE);
-        newValue = GetControlValue(gScrollBar) - overflow;
-        if (newValue < 0)
-            newValue = 0;
-        SetControlValue(gScrollBar, newValue);
-    }
+    if (lineBottom > viewBottom)
+        TEScroll(0, viewBottom - lineBottom, gActiveTE);
+    else if (lineTop < viewTop)
+        TEScroll(0, viewTop - lineTop, gActiveTE);
+
+    SyncScrollbarToOffset();
 }
 
 static pascal void ScrollAction(ControlHandle control, short part)
 {
-    short value, max, delta, newValue;
+    short max, delta, desired;
     short pageSize;
 
     if (part == 0)
         return;
 
-    value = GetControlValue(control);
     max = GetControlMaximum(control);
     pageSize = (**gActiveTE).viewRect.bottom - (**gActiveTE).viewRect.top;
 
@@ -313,32 +355,29 @@ static pascal void ScrollAction(ControlHandle control, short part)
         default:           delta = 0; break;
     }
 
-    newValue = value + delta;
-    if (newValue < 0) newValue = 0;
-    if (newValue > max) newValue = max;
+    desired = CurrentScrollOffset(gActiveTE) + delta;
+    if (desired < 0) desired = 0;
+    if (desired > max) desired = max;
 
-    if (newValue != value) {
-        TEScroll(0, value - newValue, gActiveTE);
-        SetControlValue(control, newValue);
-    }
+    TEScroll(0, CurrentScrollOffset(gActiveTE) - desired, gActiveTE);
+    SetControlValue(control, CurrentScrollOffset(gActiveTE));
 }
 
 static void DoScrollClick(Point pt)
 {
     ControlHandle control;
     short part;
-    short oldValue, newValue;
+    short desired;
 
     part = FindControl(pt, gWindow, &control);
     if (part == 0 || control != gScrollBar)
         return;
 
     if (part == inThumb) {
-        oldValue = GetControlValue(gScrollBar);
         TrackControl(gScrollBar, pt, NULL);
-        newValue = GetControlValue(gScrollBar);
-        if (newValue != oldValue)
-            TEScroll(0, oldValue - newValue, gActiveTE);
+        desired = GetControlValue(gScrollBar);
+        TEScroll(0, CurrentScrollOffset(gActiveTE) - desired, gActiveTE);
+        SyncScrollbarToOffset();
     } else {
         TrackControl(gScrollBar, pt, NewControlActionUPP(ScrollAction));
     }
@@ -388,6 +427,28 @@ typedef struct {
     recording where the surviving text landed so styling can be applied
     afterward, in the stripped buffer's own coordinates.
 */
+/*
+    gTE and gHiddenTE are both bound to gWindow (a TE record draws into
+    whatever GrafPort was current at TEStyleNew time, for its whole
+    lifetime, regardless of which one is "active" later) -- so editing
+    the *inactive* record still paints onto the window. Moving its
+    viewRect off-screen for the duration of a rebuild makes those calls
+    draw nothing, since drawing is clipped to viewRect every time.
+*/
+#define OFFSCREEN_COORD (-32000)
+
+static void SuppressDrawing(TEHandle te, Rect *saved)
+{
+    *saved = (**te).viewRect;
+    SetRect(&(**te).viewRect, OFFSCREEN_COORD, OFFSCREEN_COORD,
+            OFFSCREEN_COORD + 100, OFFSCREEN_COORD + 100);
+}
+
+static void RestoreDrawing(TEHandle te, Rect *saved)
+{
+    (**te).viewRect = *saved;
+}
+
 static void BuildHiddenView(void)
 {
     Handle srcH;
@@ -400,6 +461,7 @@ static void BuildHiddenView(void)
     short fontNum;
     TextStyle ts;
     short k;
+    Rect savedViewRect;
 
     opCount = 0;
     srcH = (**gTE).hText;
@@ -532,6 +594,8 @@ static void BuildHiddenView(void)
     HUnlock(srcH);
     HUnlock(outH);
 
+    SuppressDrawing(gHiddenTE, &savedViewRect);
+
     TESetSelect(0, 32767, gHiddenTE);
     TEDelete(gHiddenTE);
     TEInsert(*outH, outLen, gHiddenTE);
@@ -575,6 +639,8 @@ static void BuildHiddenView(void)
     }
 
     TESetSelect(0, 0, gHiddenTE);
+
+    RestoreDrawing(gHiddenTE, &savedViewRect);
 }
 
 /*
@@ -595,6 +661,7 @@ static void SyncHiddenToCanonical(void)
     long outLen;
     long lineStart;
     short monacoFont;
+    Rect savedViewRect;
 
     srcH = (**gHiddenTE).hText;
     len = (**gHiddenTE).teLength;
@@ -689,12 +756,16 @@ static void SyncHiddenToCanonical(void)
     HUnlock(srcH);
     HUnlock(outH);
 
+    SuppressDrawing(gTE, &savedViewRect);
+
     TESetSelect(0, 32767, gTE);
     TEDelete(gTE);
     TEInsert(*outH, outLen, gTE);
     DisposeHandle(outH);
 
     ClearStyles();
+
+    RestoreDrawing(gTE, &savedViewRect);
 }
 
 /*
@@ -762,6 +833,7 @@ static void ApplyZoomIndex(short newIndex)
     ClearStyles();
     RescaleStyles(gHiddenTE, oldBase, newBase);
     SaveZoomPref();
+    AdjustScrollbar();
     InvalRect(&gWindow->portRect);
 }
 
@@ -803,6 +875,7 @@ static void SetViewMode(Boolean hideMarkdown)
     CheckItem(gViewMenu, iMarkdownView, !hideMarkdown);
     CheckItem(gViewMenu, iWriterView, hideMarkdown);
     UpdateMenuBarLook();
+    AdjustScrollbar();
     InvalRect(&gWindow->portRect);
 }
 
@@ -854,6 +927,7 @@ static void ReadFile(StringPtr name, short vRefNum)
 
     gDirty = false;
     RefreshActiveView();
+    AdjustScrollbar();
     InvalRect(&gWindow->portRect);
 }
 
@@ -961,6 +1035,7 @@ static void DoNewFile(void)
     gHaveFile = false;
     gDirty = false;
     RefreshActiveView();
+    AdjustScrollbar();
     InvalRect(&gWindow->portRect);
 }
 
@@ -1536,6 +1611,7 @@ static void DoMenuCommand(long menuResult)
             }
             ClearStyles();
         }
+        AdjustScrollbar();
     } else if (menuID == mView) {
         switch (menuItem) {
             case iMarkdownView: SetViewMode(false); break;
@@ -1556,6 +1632,10 @@ static void EventLoop(void)
 
     while (!gDone) {
         if (WaitNextEvent(everyEvent, &event, 15, NULL)) {
+            /* Disposing a dialog/window doesn't restore the caller's port
+               -- cheap insurance against any path (found or not) leaving
+               thePort dangling at a freed window's memory. */
+            SetPort(gWindow);
             switch (event.what) {
                 case updateEvt:
                     DoUpdate((WindowPtr) event.message);
@@ -1591,6 +1671,7 @@ static void EventLoop(void)
                                 DetectInlineMarkdown(key);
                         }
                         ScrollCaretIntoView();
+                        UpdateScrollbarRange();
                     }
                     break;
                 }
@@ -1603,7 +1684,6 @@ static void EventLoop(void)
                     break;
             }
         }
-        AdjustScrollbar();
         TEIdle(gActiveTE);
     }
 }
@@ -1656,6 +1736,7 @@ static void ShowSplashScreen(void)
         } while (item != iSplashNew && item != iSplashOpen);
 
         DisposeDialog(dlg);
+        SetPort(gWindow);
         UpdateMenuBarLook();
 
         /* Open Document, then Cancel in the file picker -- show the splash again */
@@ -1671,6 +1752,15 @@ int main(void)
     LoadZoomPref();
     MakeMenu();
     MakeWindow();
+
+    /* A newly-created visible window has its whole content area marked
+       invalid automatically, but the splash dialog appears before the
+       event loop ever gets a chance to dequeue and process that update
+       event -- force the real BeginUpdate/TEUpdate/EndUpdate cycle to
+       happen now, so the window has gone through one proper paint before
+       the user can type anything. Without this, the very first line typed
+       (before any other update has occurred) doesn't render reliably. */
+    DoUpdate(gWindow);
 
     CountAppFiles(&message, &count);
     if (count >= 1 && message == appOpen)
