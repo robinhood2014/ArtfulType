@@ -80,7 +80,7 @@ static void MakeMenu(void)
     MenuHandle helpMenu;
 
     fileMenu = NewMenu(mFile, "\pFile");
-    AppendMenu(fileMenu, "\pNew/N;Open.../O;Save/S;Save As...;(-;Quit/Q");
+    AppendMenu(fileMenu, "\pNew/N;Open.../O;Save/S;Save As...;(-;Page Setup;Print/P;(-;Quit/Q");
     InsertMenu(fileMenu, 0);
 
     /* No "/" shortcut on Redo -- it would register as a second cmd-key
@@ -172,6 +172,8 @@ static void DoMenuCommand(long menuResult)
                 break;
             case iSave:   DoSave(); break;
             case iSaveAs: DoSaveAs(); break;
+            case iPageSetup: DoPageSetup(); break;
+            case iPrint: DoPrint(); break;
             case iQuit:
                 if (ConfirmDiscardChanges())
                     gDone = true;

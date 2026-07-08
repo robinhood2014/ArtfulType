@@ -24,12 +24,16 @@
 #define FONT_SIZE 18
 #define SCROLLBAR_WIDTH 16
 
-#define mFile    128
-#define iNew     1
-#define iOpen    2
-#define iSave    3
-#define iSaveAs  4
-#define iQuit    6
+#define mFile      128
+#define iNew       1
+#define iOpen      2
+#define iSave      3
+#define iSaveAs    4
+/* separator occupies item 5 */
+#define iPageSetup 6
+#define iPrint     7
+/* separator occupies item 8 */
+#define iQuit      9
 
 #define mEdit    131
 #define iUndo    1
@@ -205,6 +209,8 @@ Boolean DoSave(void);
 Boolean ConfirmDiscardChanges(void);
 Boolean DoOpenFile(void);
 void DoNewFile(void);
+void DoPageSetup(void);
+void DoPrint(void);
 
 /* splash.c */
 void ShowSplashScreen(void);
